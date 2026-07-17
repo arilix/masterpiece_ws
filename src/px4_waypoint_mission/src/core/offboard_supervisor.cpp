@@ -1,0 +1,514 @@
+#include "px4_waypoint_mission/offboard_supervisor.h"
+
+#include <cmath>
+#include <algorithm>
+#include <functional>
+#include <limits>
+
+using namespace std::chrono_literals;
+
+namespace px4_waypoint_mission
+{
+
+namespace
+{
+const auto kPx4InQos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+const auto kPx4OutQos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+}
+
+OffboardSupervisor::OffboardSupervisor()
+: Node("offboard_supervisor"), started_at_(now())
+{
+  publish_rate_hz_ = declare_parameter("publish_rate_hz", 20.0);
+  prestream_s_ = declare_parameter("prestream_seconds", 1.5);
+  mission_start_timeout_s_ = declare_parameter("mission_start_timeout_seconds", 30.0);
+  mission_timeout_s_ = declare_parameter("mission_timeout_seconds", 1.0);
+  position_timeout_s_ = declare_parameter("position_timeout_seconds", 1.0);
+  feedforward_timeout_s_ = declare_parameter("feedforward_timeout_seconds", 1.0);
+  battery_land_threshold_ = declare_parameter("battery_land_threshold_percent", 15.0) / 100.0;
+  battery_timeout_s_ = declare_parameter("battery_timeout_seconds", 2.0);
+  battery_time_reserve_s_ = declare_parameter("battery_time_reserve_seconds", 30.0);
+  battery_debounce_samples_ = static_cast<int>(
+    declare_parameter<int64_t>("battery_debounce_samples", 3));
+  require_battery_status_ = declare_parameter("require_battery_status", true);
+  auto_arm_ = declare_parameter("auto_arm", false);
+  target_system_ = static_cast<uint8_t>(declare_parameter("target_system", 1));
+  target_component_ = static_cast<uint8_t>(declare_parameter("target_component", 1));
+  land_detected_timeout_s_ = declare_parameter("land_detected_timeout_seconds", 1.0);
+  disarm_after_land_ = declare_parameter("disarm_after_land", true);
+  disarm_after_land_delay_s_ = declare_parameter("disarm_after_land_delay_seconds", 2.0);
+  land_command_warn_after_attempts_ = static_cast<int>(
+    declare_parameter<int64_t>("land_command_warn_after_attempts", 5));
+  // ControlAllocatorStatus TIDAK dibridge secara default oleh
+  // uxrce_dds_client dds_topics.yaml PX4 1.16.1. require_control_allocator_status
+  // default false agar tidak mengubah perilaku existing deployment; set true
+  // hanya setelah menambah entri topic tsb dan rebuild+reflash firmware
+  // (lihat PX4-Autopilot-1.16.1/src/modules/uxrce_dds_client/dds_topics.yaml).
+  require_control_allocator_status_ = declare_parameter("require_control_allocator_status", false);
+  yaw_unallocated_torque_threshold_ = declare_parameter("yaw_unallocated_torque_threshold", 0.02);
+  yaw_saturation_debounce_s_ = declare_parameter("yaw_saturation_debounce_seconds", 1.0);
+  yaw_saturation_recovery_s_ = declare_parameter("yaw_saturation_recovery_seconds", 1.0);
+  yaw_saturation_land_timeout_s_ = declare_parameter("yaw_saturation_land_timeout_seconds", 6.0);
+  if (publish_rate_hz_ < 5.0 || mission_timeout_s_ < 0.2 || position_timeout_s_ < 0.2 ||
+    battery_land_threshold_ <= 0.0 || battery_land_threshold_ >= 1.0 ||
+    battery_timeout_s_ < 0.2 || battery_debounce_samples_ < 1)
+  {
+    throw std::runtime_error("Rate minimal 5 Hz dan timeout minimal 0.2 s");
+  }
+  if (feedforward_timeout_s_ <= 0.0 || battery_time_reserve_s_ < 0.0 ||
+    land_detected_timeout_s_ <= 0.0 || disarm_after_land_delay_s_ < 0.0 ||
+    land_command_warn_after_attempts_ < 1 || yaw_unallocated_torque_threshold_ <= 0.0 ||
+    yaw_saturation_debounce_s_ <= 0.0 || yaw_saturation_recovery_s_ <= 0.0 ||
+    yaw_saturation_land_timeout_s_ <= 0.0)
+  {
+    throw std::runtime_error(
+            "Parameter land-confirmation/saturation-monitor/battery-reserve tidak valid");
+  }
+
+  offboard_mode_pub_ = create_publisher<px4_msgs::msg::OffboardControlMode>(
+    "/fmu/in/offboard_control_mode", kPx4OutQos);
+  trajectory_pub_ = create_publisher<px4_msgs::msg::TrajectorySetpoint>(
+    "/fmu/in/trajectory_setpoint", kPx4OutQos);
+  command_pub_ = create_publisher<px4_msgs::msg::VehicleCommand>(
+    "/fmu/in/vehicle_command", kPx4OutQos);
+  local_sub_ = create_subscription<px4_msgs::msg::VehicleLocalPosition>(
+    "/fmu/out/vehicle_local_position", kPx4InQos,
+    std::bind(&OffboardSupervisor::on_local_position, this, std::placeholders::_1));
+  status_sub_ = create_subscription<px4_msgs::msg::VehicleStatus>(
+    "/fmu/out/vehicle_status", kPx4InQos,
+    std::bind(&OffboardSupervisor::on_vehicle_status, this, std::placeholders::_1));
+  ack_sub_ = create_subscription<px4_msgs::msg::VehicleCommandAck>(
+    "/fmu/out/vehicle_command_ack", kPx4InQos,
+    std::bind(&OffboardSupervisor::on_command_ack, this, std::placeholders::_1));
+  target_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+    "/mission/target_ned", rclcpp::QoS(1).reliable(),
+    std::bind(&OffboardSupervisor::on_target, this, std::placeholders::_1));
+  feedforward_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
+    "/mission/target_feedforward", rclcpp::QoS(1).reliable(),
+    std::bind(&OffboardSupervisor::on_feedforward, this, std::placeholders::_1));
+  mission_state_sub_ = create_subscription<std_msgs::msg::UInt32>(
+    "/mission/current_waypoint", rclcpp::QoS(1).reliable(),
+    std::bind(&OffboardSupervisor::on_mission_state, this, std::placeholders::_1));
+  mission_abort_sub_ = create_subscription<std_msgs::msg::Bool>(
+    "/mission/abort", rclcpp::QoS(1).reliable().transient_local(),
+    std::bind(&OffboardSupervisor::on_mission_abort, this, std::placeholders::_1));
+  battery_sub_ = create_subscription<px4_msgs::msg::BatteryStatus>(
+    "/fmu/out/battery_status", kPx4InQos,
+    std::bind(&OffboardSupervisor::on_battery_status, this, std::placeholders::_1));
+  land_detected_sub_ = create_subscription<px4_msgs::msg::VehicleLandDetected>(
+    "/fmu/out/vehicle_land_detected", kPx4InQos,
+    std::bind(&OffboardSupervisor::on_land_detected, this, std::placeholders::_1));
+  // NOTE: lihat komentar require_control_allocator_status_ di atas soal DDS bridge.
+  control_allocator_status_sub_ = create_subscription<px4_msgs::msg::ControlAllocatorStatus>(
+    "/fmu/out/control_allocator_status", kPx4InQos,
+    std::bind(&OffboardSupervisor::on_control_allocator_status, this, std::placeholders::_1));
+
+  timer_ = create_wall_timer(
+    std::chrono::duration<double>(1.0 / publish_rate_hz_),
+    std::bind(&OffboardSupervisor::tick, this));
+  RCLCPP_WARN(get_logger(), "Supervisor aktif; auto_arm=%s. Pastikan area terbang aman.",
+    auto_arm_ ? "true" : "false");
+  if (!require_control_allocator_status_) {
+    RCLCPP_WARN(get_logger(),
+      "require_control_allocator_status=false: yaw-authority saturation monitor tidak aktif "
+      "(topic belum di-bridge di firmware default). Lihat GAP_IMPLEMENTASI_DAN_ROADMAP.md §4.4.");
+  }
+}
+
+uint64_t OffboardSupervisor::timestamp_us() const
+{
+  return static_cast<uint64_t>(get_clock()->now().nanoseconds() / 1000);
+}
+
+void OffboardSupervisor::on_local_position(
+  const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg)
+{
+  local_position_ = *msg;
+  last_position_at_ = now();
+  if (!hold_initialized_ && msg->xy_valid && msg->z_valid && std::isfinite(msg->heading)) {
+    hold_north_ = msg->x;
+    hold_east_ = msg->y;
+    hold_down_ = msg->z;
+    hold_yaw_ = msg->heading;
+    hold_initialized_ = true;
+    RCLCPP_INFO(get_logger(), "Safe hold NED ditangkap: [%.2f, %.2f, %.2f], yaw %.3f",
+      hold_north_, hold_east_, hold_down_, hold_yaw_);
+  }
+}
+
+void OffboardSupervisor::on_vehicle_status(const px4_msgs::msg::VehicleStatus::SharedPtr msg)
+{
+  vehicle_status_ = *msg;
+}
+
+void OffboardSupervisor::on_command_ack(const px4_msgs::msg::VehicleCommandAck::SharedPtr msg)
+{
+  if (msg->command == px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE ||
+    msg->command == px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND ||
+    msg->command == px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM)
+  {
+    RCLCPP_INFO(get_logger(), "PX4 ACK command=%u result=%u", msg->command, msg->result);
+  }
+  if (msg->command == px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND) {
+    last_land_ack_result_ = msg->result;
+  }
+}
+
+void OffboardSupervisor::on_target(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+{
+  const auto & p = msg->pose.position;
+  if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+    request_auto_land("target mission berisi NaN/Inf");
+    return;
+  }
+  target_ = *msg;
+  last_target_at_ = now();
+  mission_seen_ = true;
+}
+
+void OffboardSupervisor::on_feedforward(const geometry_msgs::msg::TwistStamped::SharedPtr msg)
+{
+  feedforward_ = *msg;
+  last_feedforward_at_ = now();
+}
+
+void OffboardSupervisor::on_mission_state(const std_msgs::msg::UInt32::SharedPtr msg)
+{
+  RCLCPP_DEBUG(get_logger(), "Waypoint aktif: %u", msg->data);
+}
+
+void OffboardSupervisor::on_mission_abort(const std_msgs::msg::Bool::SharedPtr msg)
+{
+  if (msg->data) {request_auto_land("mission node mengirim abort");}
+}
+
+void OffboardSupervisor::on_land_detected(
+  const px4_msgs::msg::VehicleLandDetected::SharedPtr msg)
+{
+  land_detected_ = *msg;
+  last_land_detected_at_ = now();
+}
+
+void OffboardSupervisor::on_control_allocator_status(
+  const px4_msgs::msg::ControlAllocatorStatus::SharedPtr msg)
+{
+  control_allocator_status_ = *msg;
+  last_control_allocator_status_at_ = now();
+}
+
+void OffboardSupervisor::on_battery_status(
+  const px4_msgs::msg::BatteryStatus::SharedPtr msg)
+{
+  battery_status_ = *msg;
+  last_battery_at_ = now();
+  const bool remaining_valid = msg->connected && std::isfinite(msg->remaining) &&
+    msg->remaining >= 0.0F && msg->remaining <= 1.0F;
+  // Item 9.1: id/priority/is_required/connected/faults/warning/time_remaining_s
+  // semuanya dipakai untuk keputusan, bukan hanya `remaining` mentah. Ini
+  // hanya mengagregasi SATU instance (default DDS bridge PX4 1.16.1 tidak
+  // membridge battery_status multi-instance); true multi-battery aggregation
+  // butuh perubahan dds_topics.yaml + firmware rebuild (lihat GAP §9.1).
+  const bool warning_critical_or_worse =
+    msg->warning >= px4_msgs::msg::BatteryStatus::WARNING_CRITICAL;
+  const bool unhealthy = msg->warning == px4_msgs::msg::BatteryStatus::WARNING_FAILED ||
+    msg->faults != 0U;
+  if (!remaining_valid && !warning_critical_or_worse && !unhealthy) {
+    battery_low_sample_count_ = 0;
+    return;
+  }
+  const bool below_threshold = remaining_valid && msg->remaining <= battery_land_threshold_;
+  const bool time_reserve_breached = std::isfinite(msg->time_remaining_s) &&
+    msg->time_remaining_s > 0.0F &&
+    static_cast<double>(msg->time_remaining_s) <= battery_time_reserve_s_;
+  if (below_threshold || warning_critical_or_worse || unhealthy || time_reserve_breached) {
+    battery_low_sample_count_ = std::min(
+      battery_low_sample_count_ + 1, battery_debounce_samples_);
+    if (battery_low_sample_count_ >= battery_debounce_samples_) {
+      battery_low_confirmed_ = true;
+    }
+  } else {
+    battery_low_sample_count_ = 0;
+  }
+}
+
+void OffboardSupervisor::publish_offboard_mode()
+{
+  px4_msgs::msg::OffboardControlMode msg{};
+  msg.timestamp = timestamp_us();
+  msg.position = true;
+  offboard_mode_pub_->publish(msg);
+}
+
+void OffboardSupervisor::publish_setpoint(
+  const double north, const double east, const double down, const double yaw,
+  const double vel_north, const double vel_east, const double vel_down, const double yawspeed)
+{
+  px4_msgs::msg::TrajectorySetpoint msg{};
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  msg.timestamp = timestamp_us();
+  msg.position = {static_cast<float>(north), static_cast<float>(east), static_cast<float>(down)};
+  msg.velocity = {
+    std::isfinite(vel_north) ? static_cast<float>(vel_north) : nan,
+    std::isfinite(vel_east) ? static_cast<float>(vel_east) : nan,
+    std::isfinite(vel_down) ? static_cast<float>(vel_down) : nan};
+  msg.acceleration = {nan, nan, nan};
+  msg.jerk = {nan, nan, nan};
+  msg.yaw = std::isfinite(yaw) ? static_cast<float>(yaw) : nan;
+  msg.yawspeed = std::isfinite(yawspeed) ? static_cast<float>(yawspeed) : nan;
+  trajectory_pub_->publish(msg);
+}
+
+void OffboardSupervisor::send_command(
+  const uint32_t command, const float param1, const float param2)
+{
+  px4_msgs::msg::VehicleCommand msg{};
+  msg.timestamp = timestamp_us();
+  msg.command = command;
+  msg.param1 = param1;
+  msg.param2 = param2;
+  msg.target_system = target_system_;
+  msg.target_component = target_component_;
+  msg.source_system = 1;
+  msg.source_component = 1;
+  msg.from_external = true;
+  command_pub_->publish(msg);
+}
+
+void OffboardSupervisor::update_land_state_machine()
+{
+  if (!landing_requested_) {return;}
+  const auto current_time = now();
+  if (land_state_ == LandState::kRequested && last_land_ack_result_.has_value() &&
+    *last_land_ack_result_ == px4_msgs::msg::VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED)
+  {
+    land_state_ = LandState::kAckConfirmed;
+    RCLCPP_INFO(get_logger(), "Land ACK diterima (ACCEPTED)");
+  }
+  if ((land_state_ == LandState::kRequested || land_state_ == LandState::kAckConfirmed) &&
+    vehicle_status_.has_value() &&
+    vehicle_status_->nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_AUTO_LAND)
+  {
+    land_state_ = LandState::kNavStateConfirmed;
+    RCLCPP_INFO(get_logger(), "PX4 nav_state = AUTO_LAND terkonfirmasi");
+  }
+  const bool land_detector_fresh = land_detected_.has_value() &&
+    (current_time - last_land_detected_at_).seconds() <= land_detected_timeout_s_;
+  if (land_state_ != LandState::kLanded && land_state_ != LandState::kDisarmed &&
+    land_detector_fresh && land_detected_->landed)
+  {
+    land_state_ = LandState::kLanded;
+    landed_at_ = current_time;
+    RCLCPP_INFO(get_logger(), "VehicleLandDetected.landed=true terkonfirmasi");
+  }
+  if (land_state_ == LandState::kLanded && disarm_after_land_ && !disarm_sent_ &&
+    landed_at_.has_value() &&
+    (current_time - *landed_at_).seconds() >= disarm_after_land_delay_s_)
+  {
+    const bool still_armed = vehicle_status_.has_value() &&
+      vehicle_status_->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED;
+    if (still_armed) {
+      send_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0F);
+      disarm_sent_ = true;
+      RCLCPP_INFO(get_logger(),
+        "Disarm dikirim setelah landed terkonfirmasi (bukan saat masih terbang)");
+    } else {
+      disarm_sent_ = true;
+      land_state_ = LandState::kDisarmed;
+    }
+  }
+  if (disarm_sent_ && land_state_ == LandState::kLanded && vehicle_status_.has_value() &&
+    vehicle_status_->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED)
+  {
+    land_state_ = LandState::kDisarmed;
+    RCLCPP_INFO(get_logger(), "Disarm terkonfirmasi; sequence Auto Land selesai");
+  }
+}
+
+void OffboardSupervisor::request_auto_land(const char * reason)
+{
+  if (!landing_requested_) {
+    RCLCPP_ERROR(get_logger(), "FAILSAFE AUTO LAND: %s", reason);
+    landing_requested_ = true;
+    land_state_ = LandState::kRequested;
+    land_requested_at_ = now();
+  }
+  const auto current_time = now();
+  if ((current_time - last_land_command_at_).seconds() >= 1.0 &&
+    land_state_ != LandState::kLanded && land_state_ != LandState::kDisarmed)
+  {
+    send_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND);
+    last_land_command_at_ = current_time;
+    ++land_command_attempts_;
+    if (land_command_attempts_ >= land_command_warn_after_attempts_ && !land_rejection_escalated_ &&
+      last_land_ack_result_.has_value() &&
+      *last_land_ack_result_ != px4_msgs::msg::VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED)
+    {
+      land_rejection_escalated_ = true;
+      RCLCPP_ERROR(get_logger(),
+        "LAND REJECTED REPEATEDLY (result=%u, attempts=%d): tetap retry NAV_LAND, "
+        "tidak memilih aksi lain otomatis. Investigasi manual diperlukan.",
+        *last_land_ack_result_, land_command_attempts_);
+    }
+  }
+  update_land_state_machine();
+}
+
+void OffboardSupervisor::update_saturation_monitor()
+{
+  if (!require_control_allocator_status_) {return;}
+  const auto current_time = now();
+  const bool status_fresh = control_allocator_status_.has_value() &&
+    (current_time - last_control_allocator_status_at_).seconds() <= 1.0;
+  const bool yaw_saturated = status_fresh && !control_allocator_status_->torque_setpoint_achieved &&
+    std::abs(static_cast<double>(control_allocator_status_->unallocated_torque[2])) >
+    yaw_unallocated_torque_threshold_;
+
+  if (yaw_saturated) {
+    yaw_saturation_recovering_since_.reset();
+    if (!yaw_saturation_since_.has_value()) {yaw_saturation_since_ = current_time;}
+  } else {
+    yaw_saturation_since_.reset();
+    if (yaw_authority_degraded_) {
+      if (!yaw_saturation_recovering_since_.has_value()) {
+        yaw_saturation_recovering_since_ = current_time;
+      } else if ((current_time - *yaw_saturation_recovering_since_).seconds() >=
+        yaw_saturation_recovery_s_)
+      {
+        yaw_authority_degraded_ = false;
+        yaw_authority_degraded_since_.reset();
+        RCLCPP_WARN(get_logger(), "Yaw authority saturation pulih; kembali normal");
+      }
+    }
+  }
+
+  if (!yaw_authority_degraded_ && yaw_saturation_since_.has_value() &&
+    (current_time - *yaw_saturation_since_).seconds() >= yaw_saturation_debounce_s_ &&
+    local_position_.has_value())
+  {
+    yaw_authority_degraded_ = true;
+    yaw_authority_degraded_since_ = current_time;
+    degraded_hold_north_ = local_position_->x;
+    degraded_hold_east_ = local_position_->y;
+    degraded_hold_down_ = local_position_->z;
+    degraded_hold_yaw_ = local_position_->heading;
+    RCLCPP_ERROR(get_logger(),
+      "Yaw authority saturation persisten: translasi dibekukan, yaw-rate command diabaikan. "
+      "unallocated_torque=[%.3f,%.3f,%.3f] unallocated_thrust=[%.3f,%.3f,%.3f]",
+      static_cast<double>(control_allocator_status_->unallocated_torque[0]),
+      static_cast<double>(control_allocator_status_->unallocated_torque[1]),
+      static_cast<double>(control_allocator_status_->unallocated_torque[2]),
+      static_cast<double>(control_allocator_status_->unallocated_thrust[0]),
+      static_cast<double>(control_allocator_status_->unallocated_thrust[1]),
+      static_cast<double>(control_allocator_status_->unallocated_thrust[2]));
+  }
+
+  if (yaw_authority_degraded_ && yaw_authority_degraded_since_.has_value() &&
+    (current_time - *yaw_authority_degraded_since_).seconds() >= yaw_saturation_land_timeout_s_)
+  {
+    request_auto_land("yaw authority saturation tidak pulih dalam batas waktu");
+  }
+}
+
+void OffboardSupervisor::tick()
+{
+  const auto current_time = now();
+  const bool position_fresh = local_position_.has_value() &&
+    (current_time - last_position_at_).seconds() <= position_timeout_s_;
+  const bool position_valid = position_fresh && local_position_->xy_valid && local_position_->z_valid;
+  const bool airborne_or_armed = vehicle_status_.has_value() &&
+    vehicle_status_->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED;
+  const bool battery_fresh = battery_status_.has_value() &&
+    (current_time - last_battery_at_).seconds() <= battery_timeout_s_;
+  const bool battery_valid = battery_fresh && battery_status_->connected &&
+    std::isfinite(battery_status_->remaining) && battery_status_->remaining >= 0.0F &&
+    battery_status_->remaining <= 1.0F;
+
+  if (battery_low_confirmed_) {
+    if (airborne_or_armed || offboard_requested_) {
+      request_auto_land("battery tersisa <= threshold / warning kritis / time-reserve Auto Land");
+    } else {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Offboard diblokir: kondisi battery gagal gate (lihat log on_battery_status)");
+    }
+    return;
+  }
+  if (require_battery_status_ && !battery_valid) {
+    if (airborne_or_armed || offboard_requested_) {
+      request_auto_land("battery status invalid atau timeout");
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Menunggu BatteryStatus valid sebelum Offboard");
+    }
+    return;
+  }
+
+  if (!position_valid) {
+    if (airborne_or_armed || offboard_requested_) {
+      request_auto_land("local position PX4 invalid atau timeout");
+    }
+    return;
+  }
+
+  if (landing_requested_) {
+    request_auto_land("pengulangan command sampai PX4 menerima Land");
+    return;
+  }
+
+  publish_offboard_mode();
+  update_saturation_monitor();
+
+  if (yaw_authority_degraded_) {
+    publish_setpoint(
+      degraded_hold_north_, degraded_hold_east_, degraded_hold_down_, degraded_hold_yaw_,
+      0.0, 0.0, 0.0, 0.0);
+  } else if (target_.has_value() &&
+    (current_time - last_target_at_).seconds() <= mission_timeout_s_)
+  {
+    const auto & pose = target_->pose;
+    const double siny_cosp = 2.0 * (pose.orientation.w * pose.orientation.z +
+      pose.orientation.x * pose.orientation.y);
+    const double cosy_cosp = 1.0 - 2.0 * (pose.orientation.y * pose.orientation.y +
+      pose.orientation.z * pose.orientation.z);
+    const double yaw = std::atan2(siny_cosp, cosy_cosp);
+    const bool feedforward_fresh = feedforward_.has_value() &&
+      (current_time - last_feedforward_at_).seconds() <= feedforward_timeout_s_;
+    const double vel_north = feedforward_fresh ? feedforward_->twist.linear.x :
+      std::numeric_limits<double>::quiet_NaN();
+    const double vel_east = feedforward_fresh ? feedforward_->twist.linear.y :
+      std::numeric_limits<double>::quiet_NaN();
+    const double vel_down = feedforward_fresh ? feedforward_->twist.linear.z :
+      std::numeric_limits<double>::quiet_NaN();
+    const double yawspeed = feedforward_fresh ? feedforward_->twist.angular.z :
+      std::numeric_limits<double>::quiet_NaN();
+    publish_setpoint(pose.position.x, pose.position.y, pose.position.z, yaw,
+      vel_north, vel_east, vel_down, yawspeed);
+  } else {
+    publish_setpoint(
+      hold_north_, hold_east_, hold_down_, hold_yaw_,
+      std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN());
+  }
+
+  if (!offboard_requested_ && hold_initialized_ &&
+    (current_time - started_at_).seconds() >= prestream_s_)
+  {
+    send_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1.0F, 6.0F);
+    offboard_requested_ = true;
+    RCLCPP_INFO(get_logger(), "Permintaan mode OFFBOARD dikirim setelah pre-stream");
+  }
+
+  if (offboard_requested_ && auto_arm_ && !arm_requested_) {
+    send_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0F);
+    arm_requested_ = true;
+  }
+
+  if (mission_seen_ && (current_time - last_target_at_).seconds() > mission_timeout_s_) {
+    request_auto_land("heartbeat/target mission hilang");
+  } else if (!mission_seen_ && offboard_requested_ &&
+    (current_time - started_at_).seconds() > mission_start_timeout_s_)
+  {
+    request_auto_land("mission tidak mulai sebelum startup timeout");
+  }
+}
+
+}  // namespace px4_waypoint_mission

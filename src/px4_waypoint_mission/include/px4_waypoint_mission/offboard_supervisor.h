@@ -1,0 +1,144 @@
+#ifndef PX4_WAYPOINT_MISSION__OFFBOARD_SUPERVISOR_H_
+#define PX4_WAYPOINT_MISSION__OFFBOARD_SUPERVISOR_H_
+
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <px4_msgs/msg/control_allocator_status.hpp>
+#include <px4_msgs/msg/offboard_control_mode.hpp>
+#include <px4_msgs/msg/battery_status.hpp>
+#include <px4_msgs/msg/trajectory_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_command.hpp>
+#include <px4_msgs/msg/vehicle_command_ack.hpp>
+#include <px4_msgs/msg/vehicle_land_detected.hpp>
+#include <px4_msgs/msg/vehicle_local_position.hpp>
+#include <px4_msgs/msg/vehicle_status.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/u_int32.hpp>
+#include <std_msgs/msg/bool.hpp>
+
+#include <chrono>
+#include <optional>
+
+namespace px4_waypoint_mission
+{
+
+class OffboardSupervisor : public rclcpp::Node
+{
+public:
+  OffboardSupervisor();
+
+private:
+  // Land confirmation state machine (GAP §6.2): supervisor tidak boleh
+  // menganggap "sudah aman" hanya karena command Land terkirim.
+  enum class LandState {kNone, kRequested, kAckConfirmed, kNavStateConfirmed, kLanded, kDisarmed};
+
+  void on_local_position(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg);
+  void on_vehicle_status(const px4_msgs::msg::VehicleStatus::SharedPtr msg);
+  void on_command_ack(const px4_msgs::msg::VehicleCommandAck::SharedPtr msg);
+  void on_target(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
+  void on_feedforward(const geometry_msgs::msg::TwistStamped::SharedPtr msg);
+  void on_mission_state(const std_msgs::msg::UInt32::SharedPtr msg);
+  void on_mission_abort(const std_msgs::msg::Bool::SharedPtr msg);
+  void on_battery_status(const px4_msgs::msg::BatteryStatus::SharedPtr msg);
+  void on_land_detected(const px4_msgs::msg::VehicleLandDetected::SharedPtr msg);
+  void on_control_allocator_status(const px4_msgs::msg::ControlAllocatorStatus::SharedPtr msg);
+  void tick();
+  void publish_offboard_mode();
+  void publish_setpoint(
+    double north, double east, double down, double yaw,
+    double vel_north, double vel_east, double vel_down, double yawspeed);
+  void send_command(uint32_t command, float param1 = 0.0F, float param2 = 0.0F);
+  void request_auto_land(const char * reason);
+  void update_land_state_machine();
+  void update_saturation_monitor();
+  uint64_t timestamp_us() const;
+
+  rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_mode_pub_;
+  rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr trajectory_pub_;
+  rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr command_pub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr local_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr status_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleCommandAck>::SharedPtr ack_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr feedforward_sub_;
+  rclcpp::Subscription<std_msgs::msg::UInt32>::SharedPtr mission_state_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_abort_sub_;
+  rclcpp::Subscription<px4_msgs::msg::BatteryStatus>::SharedPtr battery_sub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleLandDetected>::SharedPtr land_detected_sub_;
+  rclcpp::Subscription<px4_msgs::msg::ControlAllocatorStatus>::SharedPtr
+    control_allocator_status_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
+
+  std::optional<px4_msgs::msg::VehicleLocalPosition> local_position_;
+  std::optional<px4_msgs::msg::VehicleStatus> vehicle_status_;
+  std::optional<geometry_msgs::msg::PoseStamped> target_;
+  std::optional<geometry_msgs::msg::TwistStamped> feedforward_;
+  std::optional<px4_msgs::msg::BatteryStatus> battery_status_;
+  std::optional<px4_msgs::msg::VehicleLandDetected> land_detected_;
+  std::optional<px4_msgs::msg::ControlAllocatorStatus> control_allocator_status_;
+  rclcpp::Time started_at_;
+  rclcpp::Time last_position_at_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_target_at_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_feedforward_at_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_land_command_at_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_battery_at_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_land_detected_at_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_control_allocator_status_at_{0, 0, RCL_ROS_TIME};
+  bool hold_initialized_{false};
+  bool offboard_requested_{false};
+  bool arm_requested_{false};
+  bool mission_seen_{false};
+  bool landing_requested_{false};
+  bool battery_low_confirmed_{false};
+  int battery_low_sample_count_{0};
+  double hold_north_{0.0};
+  double hold_east_{0.0};
+  double hold_down_{0.0};
+  double hold_yaw_{NAN};
+  double publish_rate_hz_;
+  double prestream_s_;
+  double mission_start_timeout_s_;
+  double mission_timeout_s_;
+  double position_timeout_s_;
+  double feedforward_timeout_s_;
+  double battery_land_threshold_;
+  double battery_timeout_s_;
+  double battery_time_reserve_s_;
+  int battery_debounce_samples_;
+  bool require_battery_status_;
+  bool auto_arm_;
+  uint8_t target_system_;
+  uint8_t target_component_;
+
+  // Land confirmation state machine.
+  LandState land_state_{LandState::kNone};
+  std::optional<rclcpp::Time> land_requested_at_;
+  std::optional<uint8_t> last_land_ack_result_;
+  std::optional<rclcpp::Time> landed_at_;
+  bool disarm_sent_{false};
+  int land_command_attempts_{0};
+  bool land_rejection_escalated_{false};
+  double land_detected_timeout_s_;
+  bool disarm_after_land_;
+  double disarm_after_land_delay_s_;
+  int land_command_warn_after_attempts_;
+
+  // ControlAllocatorStatus / yaw-authority saturation monitor (GAP §4.4).
+  bool require_control_allocator_status_;
+  double yaw_unallocated_torque_threshold_;
+  double yaw_saturation_debounce_s_;
+  double yaw_saturation_recovery_s_;
+  double yaw_saturation_land_timeout_s_;
+  std::optional<rclcpp::Time> yaw_saturation_since_;
+  std::optional<rclcpp::Time> yaw_saturation_recovering_since_;
+  std::optional<rclcpp::Time> yaw_authority_degraded_since_;
+  bool yaw_authority_degraded_{false};
+  double degraded_hold_north_{0.0};
+  double degraded_hold_east_{0.0};
+  double degraded_hold_down_{0.0};
+  double degraded_hold_yaw_{0.0};
+};
+
+}  // namespace px4_waypoint_mission
+
+#endif  // PX4_WAYPOINT_MISSION__OFFBOARD_SUPERVISOR_H_

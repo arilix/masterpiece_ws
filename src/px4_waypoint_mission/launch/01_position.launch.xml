@@ -1,0 +1,14 @@
+<launch>
+  <arg name="wp" default="0" description="0=report only; 1..10=record selected waypoint"/>
+  <arg name="mission_file"
+       default="$(find-pkg-share px4_waypoint_mission)/config/waypoints.yaml"/>
+  <node pkg="px4_waypoint_mission" exec="position_reporter_node"
+        name="position_reporter" output="screen">
+    <param name="wp" value="$(var wp)"/>
+    <param name="mission_file" value="$(var mission_file)"/>
+    <param name="sample_count" value="20"/>
+    <param name="max_eph_m" value="1.5"/>
+    <param name="max_epv_m" value="2.5"/>
+    <param name="max_sample_spread_m" value="1.0"/>
+  </node>
+</launch>
