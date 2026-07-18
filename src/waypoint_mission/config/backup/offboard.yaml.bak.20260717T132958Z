@@ -1,0 +1,39 @@
+offboard_supervisor:
+  ros__parameters:
+    publish_rate_hz: 20.0
+    prestream_seconds: 1.5
+    mission_start_timeout_seconds: 30.0
+    mission_timeout_seconds: 1.0
+    position_timeout_seconds: 1.0
+    # Freshness untuk feed-forward yaw-rate/velocity dari mission node
+    # (GAP §4.3/§5.1). Basi -> feed-forward diabaikan (NaN), posisi tetap dikirim.
+    feedforward_timeout_seconds: 1.0
+    battery_land_threshold_percent: 15.0
+    battery_timeout_seconds: 2.0
+    # Time-to-land reserve (GAP §9.1): Auto Land juga jika BatteryStatus.time_remaining_s
+    # turun di bawah nilai ini (selain threshold persen dan warning/faults).
+    battery_time_reserve_seconds: 30.0
+    battery_debounce_samples: 3
+    require_battery_status: true
+    auto_arm: false
+    target_system: 1
+    target_component: 1
+    # Land confirmation state machine (GAP §6.2).
+    land_detected_timeout_seconds: 1.0
+    disarm_after_land: true
+    disarm_after_land_delay_seconds: 2.0
+    land_command_warn_after_attempts: 5
+    # PX4 1.16 uXRCE-DDS mem-publish VehicleStatus sebagai vehicle_status_v1.
+    # Override ke /fmu/out/vehicle_status hanya bila firmware/bridge memakai
+    # nama topic lama.
+    vehicle_status_topic: "/fmu/out/vehicle_status_v1"
+    # ControlAllocatorStatus / yaw-authority saturation monitor (GAP §4.4).
+    # require_control_allocator_status=false karena topic ini TIDAK dibridge
+    # oleh dds_topics.yaml default PX4 1.16.1. Set true HANYA setelah entri
+    # /fmu/out/control_allocator_status ditambahkan ke firmware, firmware
+    # di-rebuild+reflash, dan audit live membuktikan topic ini muncul.
+    require_control_allocator_status: false
+    yaw_unallocated_torque_threshold: 0.02
+    yaw_saturation_debounce_seconds: 1.0
+    yaw_saturation_recovery_seconds: 1.0
+    yaw_saturation_land_timeout_seconds: 6.0

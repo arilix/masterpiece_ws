@@ -1,0 +1,11 @@
+<launch>
+  <arg name="config" default="$(find-pkg-share waypoint_mission)/config/waypoints.yaml"/>
+  <arg name="tf_mini" default="false"/>
+  <arg name="tf_mini_range_topic" default="/range"/>
+  <node pkg="waypoint_mission" exec="waypoint_mission_node"
+        name="waypoint_mission" output="screen">
+    <param from="$(var config)"/>
+    <param name="use_tf_mini_altitude" value="$(var tf_mini)"/>
+    <param name="tf_mini_range_topic" value="$(var tf_mini_range_topic)"/>
+  </node>
+</launch>

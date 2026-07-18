@@ -1,0 +1,83 @@
+waypoint_mission:
+  ros__parameters:
+    # Versi schema file waypoint. Hanya versi 1 yang dipahami; naikkan hanya
+    # jika format field waypoint berubah (lihat GAP_IMPLEMENTASI_DAN_ROADMAP.md §10).
+    schema_version: 1
+    # CONTOH PX4 SITL Zurich -- WAJIB ganti untuk lokasi real-world.
+    # Format: "latitude_deg,longitude_deg,altitude_m,alt_frame,yaw_rad,hold_seconds[,FLY_THROUGH]"
+    # alt_frame: REL_HOME (di atas home) atau AMSL (altitude absolut).
+    #   TERRAIN diparsing tapi SELALU ditolak saat feasibility check -- belum
+    #   ada sumber DEM/datum tervalidasi di workspace ini (GAP §8.2).
+    # Field ke-7 opsional FLY_THROUGH: hanya valid jika hold_seconds=0 dan
+    # bukan waypoint terakhir; opt-in, belum divalidasi flight test (GAP §5.1).
+    # Uji awal: hanya WP1-WP3 aktif. WP4-WP10 dikomentari sampai test 3 titik aman.
+    waypoints:
+      - "-7.31083468,112.72858900,1.000,REL_HOME,nan,5.000"
+      - "-7.31087172,112.72861102,1.000,REL_HOME,nan,5.000"
+      - "-7.31087732,112.72866262,1.000,REL_HOME,nan,5.000"
+      # - "47.3978320,8.5456600,1.0,REL_HOME,nan,5.0"
+      # - "47.3978320,8.5457260,1.0,REL_HOME,nan,5.0"
+      # - "47.3977870,8.5457260,1.0,REL_HOME,nan,5.0"
+      # - "47.3977420,8.5457260,1.0,REL_HOME,nan,5.0"
+      # - "47.3977420,8.5456600,1.0,REL_HOME,nan,5.0"
+      # - "47.3977870,8.5456600,1.0,REL_HOME,nan,5.0"
+      # - "47.3977420,8.5455940,1.0,REL_HOME,nan,10.0"
+    acceptance_xy_m: 0.5
+    acceptance_z_m: 0.4
+    stopped_speed_mps: 0.3
+    publish_rate_hz: 10.0
+    yaw_acceptance_rad: 0.12
+    max_yaw_rate_rad_s: 0.7
+    # Percepatan yaw maksimum (GAP §4.3); membuat transisi yaw-rate halus,
+    # bukan hanya step-limited seperti sebelumnya.
+    max_yaw_accel_rad_s2: 0.6
+    # Rotasi tetap diarahkan ke bearing LLA waypoint berikutnya. Untuk uji awal,
+    # tidak menunggu /fmu/out/vehicle_angular_velocity; alignment cukup dari
+    # heading estimator + yaw setpoint internal.
+    yaw_rate_stopped_rad_s: 0.06
+    angular_velocity_timeout_s: 0.5
+    require_yaw_rate_feedback: false
+    # Watchdog rotasi (GAP §4.2): timeout absolut + minimum progress per window.
+    yaw_alignment_timeout_s: 20.0
+    yaw_stuck_window_s: 3.0
+    yaw_stuck_min_progress_rad: 0.02
+    # Watchdog takeoff (GAP §6.1): timeout absolut + minimum climb progress.
+    takeoff_timeout_s: 30.0
+    takeoff_stuck_window_s: 4.0
+    takeoff_stuck_min_progress_m: 0.08
+    land_detected_timeout_s: 1.0
+    max_eph_m: 2.0
+    max_epv_m: 3.0
+    global_position_timeout_s: 1.0
+    max_segment_length_m: 500.0
+    max_distance_from_home_m: 1000.0
+    # Untuk uji 1 meter AGL/REL_HOME. Naikkan kembali sebelum mission normal.
+    min_altitude_above_home_m: 0.2
+    max_altitude_above_home_m: 120.0
+    # Reset-storm guard (GAP §7.1): abort jika reset estimator terlalu sering.
+    reset_storm_window_s: 30.0
+    max_resets_per_window: 4
+    # Custom geofence (GAP §8.1), opsional. Format titik "lat,lon" dipisah ';'.
+    # Kosongkan geofence_inclusion untuk tidak membatasi area luar.
+    geofence_inclusion: ""
+    # geofence_exclusions sengaja TIDAK dituliskan di sini: YAML '[]' kosong
+    # ambigu tipenya untuk rclcpp (ValueError saat declare_parameter). Biarkan
+    # tidak diset agar default C++ (vector<string> kosong) yang dipakai; isi
+    # hanya jika benar-benar ada polygon exclusion, misalnya:
+    #   geofence_exclusions: ["lat,lon;lat,lon;lat,lon"]
+    geofence_margin_m: 5.0
+    geofence_sample_resolution_m: 5.0
+    # Fly-through (GAP §5.1), hanya berlaku untuk waypoint dengan field ke-7
+    # FLY_THROUGH. Belum divalidasi flight test -- default tidak ada waypoint
+    # contoh yang memakainya.
+    fly_through_speed_mps: 1.5
+    fly_through_pass_radius_m: 1.5
+    fly_through_yaw_tolerance_rad: 0.35
+    require_offboard: true
+    # Jika launch mission memakai tf_mini:=true, altitude reached/takeoff watchdog
+    # memakai sensor_msgs/Range dari topic /range sebagai gate ketinggian.
+    use_tf_mini_altitude: false
+    tf_mini_range_topic: "/range"
+    tf_mini_timeout_s: 0.5
+    # PX4 1.16 uXRCE-DDS mem-publish VehicleStatus sebagai vehicle_status_v1.
+    vehicle_status_topic: "/fmu/out/vehicle_status_v1"
